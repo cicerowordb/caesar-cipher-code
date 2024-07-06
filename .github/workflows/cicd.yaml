@@ -1,0 +1,108 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      ### Starting the preparation phase
+      - name: Checkout code from triggered branch
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies (App)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install dependencies (Tests)
+        run: |
+          pip install -r requirements-test.txt
+
+      ### Starting the CI phase
+      - name: Run unit tests
+        run: PYTHONPATH=$PWD pytest -s 
+
+      - name: Lint with pylint
+        run: pylint --fail-under=9 *.py
+
+      - name: Check dependencies with safety
+        run: safety check -r requirements.txt
+
+      - name: Security analysis with bandit
+        run: bandit *.py
+
+      ### Starting the CD (delivery) phase
+      - name: Insert Docker Image Lables
+        run: |
+          echo LABEL GITHUB_REPOSITORY="$GITHUB_REPOSITORY." >> Dockerfile
+          echo LABEL GITHUB_REF_NAME="$GITHUB_REF_NAME." >> Dockerfile
+          echo LABEL GITHUB_SHA="$GITHUB_SHA." >> Dockerfile
+          echo LABEL GITHUB_RUN_NUMBER="$GITHUB_RUN_NUMBER." >> Dockerfile
+
+      - name: Build Docker image
+        run: |
+          export IMAGE_TAG=$(head -n1 CHANGELOG.md|tr -d 'A-Z# /\$@!$&*()[]_=+')-run$GITHUB_RUN_NUMBER
+          docker build -t cicerow/caesar-cipher:$IMAGE_TAG .
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Push Docker image to Docker Hub
+        run: |
+          export IMAGE_TAG=$(head -n1 CHANGELOG.md|tr -d 'A-Z# /\$@!$&*()[]_=+')-run$GITHUB_RUN_NUMBER
+          docker push cicerow/caesar-cipher:$IMAGE_TAG
+          docker tag  cicerow/caesar-cipher:$IMAGE_TAG cicerow/caesar-cipher:latest
+
+      ### Starting the CD (deployment) phase
+      ### Other parts of deployment executed in manifests repository
+      - name: Update Application Manifests
+        env:
+          MANIFESTS_REPOSITORY_AUTH_URL: ${{ secrets.MANIFESTS_REPOSITORY_AUTH_URL }}
+        run: |
+          export IMAGE_TAG=$(head -n1 CHANGELOG.md|tr -d 'A-Z# /\$@!$&*()[]_=+')-run$GITHUB_RUN_NUMBER
+          export MANIFESTS_REPOSITORY_BRANCH=main
+          echo ---CLONE MANIFESTS REPOSITORY---
+          git clone ${MANIFESTS_REPOSITORY_AUTH_URL} ./manifests_repository_dir
+          git checkout $MANIFESTS_REPOSITORY_BRANCH
+          echo ---CHANGE MANIFESTS---
+          cd manifests_repository_dir
+          ls -la
+          export NEW_DEPLOYMENT=$(sed s/"image: cicerow\/caesar-cipher:[0-9a-z.-]*"/"image: cicerow\/caesar-cipher":$IMAGE_TAG/ caesar-cipher-deploy.yaml)
+          echo ---1
+          export NEW_DEPLOYMENT=$(sed s/"version: [0-9a-z.-]*"/"version: "$IMAGE_TAG/ <<< "$NEW_DEPLOYMENT")
+          echo ---2
+          export NEW_SERVICE=$(sed s/"version: [0-9a-z.-]*"/"version: "$IMAGE_TAG/ caesar-cipher-service.yaml)
+          echo ---3
+          echo "-----OLD DEPLOYMENT-----"
+          cat caesar-cipher-deploy.yaml
+          echo "-----NEW DEPLOYMENT-----"
+          echo "$NEW_DEPLOYMENT" > caesar-cipher-deploy.yaml
+          cat caesar-cipher-deploy.yaml
+          echo "-----OLD SERVICE-----"
+          cat caesar-cipher-service.yaml
+          echo "-----NEW SERVICE-----"
+          echo "$NEW_SERVICE" > caesar-cipher-service.yaml
+          cat caesar-cipher-service.yaml
+          echo ---UPDATE GIT REPOSITORY---
+          git config --global user.email "cicerow_ordb@gmail.com"
+          git config --global user.name "Cicero Woshington"
+          git status --short
+          git add caesar-cipher-deploy.yaml caesar-cipher-service.yaml
+          (git commit -m "[UPDT][AUTOM] Change image/version" && git push --force) || echo Git commit/push fail! Nothing to commit?
